@@ -25,11 +25,11 @@ services:
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
 
       # Listeners
-      # this setup allows the docker net to connect via kfk:xxxx and then lh:xxxx allows host machine to connect 
+      # this setup allows the docker net to connect via kfk:xxxx and then lh:xxxx allows host machine to connect
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
-      
+
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      
+
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
 
@@ -56,3 +56,95 @@ services:
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: logs
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  consumer:
+    build: ./services/consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER: kafka:29092
+      KAFKA_TOPIC: logs.raw
+      KAFKA_GROUP_ID: consumer-group
+      POSTGRES_URL: postgres://app:app@postgres:5432/logs
+
+  detector:
+    build: ./services/detector
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER: kafka:29092
+      INPUT_TOPIC: logs.raw
+      OUTPUT_TOPIC: logs.anomalies
+      KAFKA_GROUP_ID: detector-group
+
+  api:
+    build: ./services/api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      POSTGRES_URL: postgres://app:app@postgres:5432/logs
+      KAFKA_BROKER: kafka:29092
+      ANOMALY_TOPIC: logs.anomalies
+
+  simulator:
+    build: ./services/simulator
+    depends_on:
+      kafka:
+        condition: service_healthy
+    profiles: ["manual"] # prevents auto-start
+
+  # --- Monitoring Stack ---
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    depends_on:
+      - kafka-exporter
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter
+    command:
+      - "--kafka.server=kafka:29092"
+    ports:
+      - "9308:9308"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+volumes:
+  pg_data:
