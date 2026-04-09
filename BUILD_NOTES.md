@@ -14,3 +14,8 @@ kafka-topics \
   --partitions 6 \
   --replication-factor 1 
 it gives us control over how we scale the consumer groups via partion-based parallelism. Control how durable our setup is and the retention policy. I explicitly create topics to control partitioning for parallel consumption.
+
+
+* In event driven architectures, the source of truth for data and the source where we store derived data should be separate. 
+
+The tradeoff is more operational overhead since now I need two Postgres containers, two init SQL files, two connection strings, and two volumes. But for this project its worth it and shows I understand the separation. In production these would just be two separate RDS instances, probably in different virtual private clouds VPCs. 

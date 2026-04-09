@@ -2,41 +2,34 @@ version: "3.9"
 
 services:
   zookeeper:
-    image: confluentinc/cp-zookeeper:7.5.0.
+    image: confluentinc/cp-zookeeper:7.5.0
     restart: always
     hostname: zoo1
     environment:
       - ZOOKEEPER_CLIENT_PORT=2181
-      - ZOO_TICK_TIME=2000 #Regulates heartbeats and timeouts
+      - ZOO_TICK_TIME=2000
     healthcheck:
       test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok"]
       interval: 10s
       timeout: 5s
       retries: 5
+
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     depends_on:
       zookeeper:
         condition: service_healthy
     ports:
-      - "9092:9092" # host access port map
+      - "9092:9092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-
-      # Listeners
-      # this setup allows the docker net to connect via kfk:xxxx and then lh:xxxx allows host machine to connect
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
-
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-
-      # Topic behavior
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
-
     healthcheck:
       test:
         [
@@ -46,6 +39,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     depends_on:
@@ -57,57 +51,105 @@ services:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
 
-  postgres:
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      bash -c "
+      kafka-topics --create --bootstrap-server kafka:29092
+        --topic logs.raw --partitions 6 --replication-factor 1 &&
+      kafka-topics --create --bootstrap-server kafka:29092
+        --topic logs.anomalies --partitions 3 --replication-factor 1 &&
+      echo 'Topics created'
+      "
+    restart: "no"
+
+  postgres-source:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: app
       POSTGRES_PASSWORD: app
       POSTGRES_DB: logs
+      POSTGRES_HOST_AUTH_METHOD: trust
+    command: >
+      postgres
+        -c wal_level=logical
+        -c max_replication_slots=4
+        -c max_wal_senders=4
+        -c wal_keep_size=256
     ports:
       - "5432:5432"
     volumes:
-      - pg_data:/var/lib/postgresql/data
+      - pg_source_data:/var/lib/postgresql/data
+      - ./infra/postgres/init_source.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U app"]
       interval: 10s
       timeout: 5s
       retries: 5
 
+  postgres-target:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: logs_target
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg_target_data:/var/lib/postgresql/data
+      - ./infra/postgres/init_target.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # consumer-group: reads logs.raw → writes to postgres-source
   consumer:
     build: ./services/consumer
     depends_on:
       kafka:
         condition: service_healthy
-      postgres:
+      postgres-source:
         condition: service_healthy
     environment:
       KAFKA_BROKER: kafka:29092
       KAFKA_TOPIC: logs.raw
       KAFKA_GROUP_ID: consumer-group
-      POSTGRES_URL: postgres://app:app@postgres:5432/logs
+      POSTGRES_URL: postgres://app:app@postgres-source:5432/logs
 
+  # detector-group: reads logs.raw independently → detection_jobs → anomalies
   detector:
     build: ./services/detector
     depends_on:
       kafka:
+        condition: service_healthy
+      postgres-source:
         condition: service_healthy
     environment:
       KAFKA_BROKER: kafka:29092
       INPUT_TOPIC: logs.raw
       OUTPUT_TOPIC: logs.anomalies
       KAFKA_GROUP_ID: detector-group
+      POSTGRES_URL: postgres://app:app@postgres-source:5432/logs
 
   api:
     build: ./services/api
     depends_on:
-      postgres:
+      postgres-source:
+        condition: service_healthy
+      postgres-target:
         condition: service_healthy
       kafka:
         condition: service_healthy
     ports:
       - "8000:8000"
     environment:
-      POSTGRES_URL: postgres://app:app@postgres:5432/logs
+      POSTGRES_URL: postgres://app:app@postgres-source:5432/logs
+      TARGET_POSTGRES_URL: postgres://app:app@postgres-target:5432/logs_target
       KAFKA_BROKER: kafka:29092
       ANOMALY_TOPIC: logs.anomalies
 
@@ -116,14 +158,68 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    profiles: ["manual"] # prevents auto-start
+    profiles: ["manual"]
 
-  # --- Monitoring Stack ---
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "/etc/redis/redis.conf"]
+    volumes:
+      - ./infra/redis/redis.conf:/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # CDC WAL watcher: postgres-source WAL → Redis Streams
+  cdc:
+    build: ./services/cdc
+    depends_on:
+      postgres-source:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SOURCE_DSN: postgresql://app:app@postgres-source:5432/logs
+      REDIS_URL: redis://redis:6379
+      REPLICATION_SLOT: log_aggregator_slot
+      WATCHED_TABLES: logs,anomalies
+    restart: on-failure 
+
+  cdc-consumer:
+    build: ./services/cdc_consumer
+    depends_on:
+      postgres-target:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      TARGET_DSN: postgresql://app:app@postgres-target:5432/logs_target
+      REDIS_URL: redis://redis:6379
+      STREAM_KEYS: cdc:logs,cdc:anomalies
+      CONSUMER_GROUP: cdc-writers
+
+  batch-aggregator:
+    build: ./services/batch_aggregator
+    depends_on:
+      postgres-source:
+        condition: service_healthy
+      postgres-target:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SOURCE_DSN: postgresql://app:app@postgres-source:5432/logs
+      TARGET_DSN: postgresql://app:app@postgres-target:5432/logs_target
+      REDIS_URL: redis://redis:6379
+      BATCH_INTERVAL_SECS: "60"
 
   prometheus:
     image: prom/prometheus:latest
     volumes:
-      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
       - "9090:9090"
     depends_on:
@@ -147,4 +243,5 @@ services:
         condition: service_healthy
 
 volumes:
-  pg_data:
+  pg_source_data:
+  pg_target_data:
